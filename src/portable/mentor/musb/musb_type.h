@@ -568,6 +568,16 @@ TU_ATTR_ALWAYS_INLINE static inline musb_ep_csr_t* get_ep_csr(musb_regs_t* musb_
 
 //*****************************************************************************
 //
+// The following are defines for the bit fields in the MUSB_O_TXMAXP / MUSB_O_RXMAXP
+// registers. Bits [10:0] carry the maximum packet size; bits [15:11] carry
+// numpackminus1 (HB-iso / HS-bulk multiplier - 1).
+//
+//*****************************************************************************
+#define MUSB_TXMAXP_PACKET_SIZE_MASK  0x07FFu
+#define MUSB_RXMAXP_PACKET_SIZE_MASK  0x07FFu
+
+//*****************************************************************************
+//
 // The following are defines for the bit fields in the MUSB_O_TXCSRL1 register.
 //
 //*****************************************************************************
