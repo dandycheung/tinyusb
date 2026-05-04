@@ -422,6 +422,7 @@ TU_ATTR_ALWAYS_INLINE static inline bool queue_event(dcd_event_t const * event, 
 //--------------------------------------------------------------------+
 // Prototypes
 //--------------------------------------------------------------------+
+static bool usbd_control_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes);
 static bool process_setup_received(uint8_t rhport, tusb_control_request_t const * p_request);
 static bool process_set_config(uint8_t rhport, uint8_t cfg_num);
 static bool process_get_descriptor(uint8_t rhport, tusb_control_request_t const * p_request);
@@ -435,9 +436,6 @@ static bool process_test_mode_cb(uint8_t rhport, uint8_t stage, tusb_control_req
   return true;
 }
 #endif
-
-// Control Endpoint
-static bool usbd_control_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes);
 
 //--------------------------------------------------------------------+
 // Weak stubs: invoked if no strong implementation is available
@@ -947,6 +945,117 @@ static bool invoke_class_control(uint8_t rhport, usbd_class_driver_t const * dri
   return driver->control_xfer_cb(rhport, CONTROL_STAGE_SETUP, request);
 }
 
+// Process a standard request to the device recipient (extracted from
+// process_setup_received for readability; GCC chooses to inline it).
+static bool process_std_device_request(uint8_t rhport, tusb_control_request_t const * p_request) {
+  switch (p_request->bRequest) { //-V2520
+    case TUSB_REQ_SET_ADDRESS:
+      // Depending on mcu, status phase could be sent either before or after changing device address,
+      // or even require stack to not response with status at all
+      // Therefore DCD must take full responsibility to response and include zlp status packet if needed.
+      dcd_set_address(rhport, (uint8_t) p_request->wValue);
+      _usbd_dev.addressed = 1;
+      return true;
+
+    case TUSB_REQ_GET_CONFIGURATION: {
+      uint8_t cfg_num = _usbd_dev.cfg_num;
+      tud_control_xfer(rhport, p_request, &cfg_num, 1);
+      return true;
+    }
+
+    case TUSB_REQ_SET_CONFIGURATION: {
+      uint8_t const cfg_num = (uint8_t) p_request->wValue;
+
+      // Only process if new configure is different
+      if (_usbd_dev.cfg_num != cfg_num) {
+        if (_usbd_dev.cfg_num != 0) {
+          // already configured: need to clear all endpoints and driver first
+          TU_LOG_USBD("  Clear current Configuration (%u) before switching\r\n", _usbd_dev.cfg_num);
+
+          dcd_sof_enable(rhport, false);
+          dcd_edpt_close_all(rhport);
+
+          // close all drivers and current configured state except bus speed
+          const uint8_t speed = _usbd_dev.speed;
+          configuration_reset(rhport);
+
+          _usbd_dev.speed = speed; // restore speed
+        }
+
+        _usbd_dev.cfg_num = cfg_num;
+
+        // Handle the new configuration
+        if (cfg_num == 0) {
+          tud_umount_cb();
+        } else {
+          if (!process_set_config(rhport, cfg_num)) {
+            _usbd_dev.cfg_num = 0;
+            TU_ASSERT(false);
+          }
+          tud_mount_cb();
+        }
+      }
+
+      tud_control_status(rhport, p_request);
+      return true;
+    }
+
+    case TUSB_REQ_GET_DESCRIPTOR:
+      return process_get_descriptor(rhport, p_request);
+
+    case TUSB_REQ_SET_FEATURE:
+      switch (p_request->wValue) { //-V2520
+        case TUSB_REQ_FEATURE_REMOTE_WAKEUP:
+          TU_LOG_USBD("    Enable Remote Wakeup\r\n");
+          // Host may enable remote wake up before suspending especially HID device
+          _usbd_dev.remote_wakeup_en = 1;
+          tud_control_status(rhport, p_request);
+          return true;
+
+        #if CFG_TUD_TEST_MODE
+        case TUSB_REQ_FEATURE_TEST_MODE: {
+          // Only handle the test mode if supported and valid
+          TU_VERIFY(0 == tu_u16_low(p_request->wIndex));
+
+          uint8_t const selector = tu_u16_high(p_request->wIndex);
+          TU_VERIFY(TUSB_FEATURE_TEST_J <= selector && selector <= TUSB_FEATURE_TEST_FORCE_ENABLE);
+
+          _usbd_dev.ctrl_xfer.complete_cb = process_test_mode_cb;
+          tud_control_status(rhport, p_request);
+          return true;
+        }
+        #endif
+
+        // Stall unsupported feature selector
+        default: return false;
+      }
+
+    case TUSB_REQ_CLEAR_FEATURE:
+      // Only support remote wakeup for device feature
+      TU_VERIFY(TUSB_REQ_FEATURE_REMOTE_WAKEUP == p_request->wValue);
+      TU_LOG_USBD("    Disable Remote Wakeup\r\n");
+
+      // Host may disable remote wake up after resuming
+      _usbd_dev.remote_wakeup_en = 0;
+      tud_control_status(rhport, p_request);
+      return true;
+
+    case TUSB_REQ_GET_STATUS: {
+      // Device status bit mask
+      // - Bit 0: Self Powered TODO must invoke callback to get actual status
+      // - Bit 1: Remote Wakeup enabled
+      uint16_t status = (uint16_t) _usbd_dev.dev_state_bm;
+      tud_control_xfer(rhport, p_request, &status, 2);
+      return true;
+    }
+
+    default:
+      TU_BREAKPOINT();
+      return false;
+  }
+}
+
+
 // This handles the actual request and its response.
 // Returns false if unable to complete the request, causing caller to stall control endpoints.
 static bool process_setup_received(uint8_t rhport, tusb_control_request_t const * p_request) {
@@ -996,113 +1105,7 @@ static bool process_setup_received(uint8_t rhport, tusb_control_request_t const 
         return false;
       }
 
-      switch (p_request->bRequest) { //-V2520
-        case TUSB_REQ_SET_ADDRESS:
-          // Depending on mcu, status phase could be sent either before or after changing device address,
-          // or even require stack to not response with status at all
-          // Therefore DCD must take full responsibility to response and include zlp status packet if needed.
-          dcd_set_address(rhport, (uint8_t) p_request->wValue);
-          _usbd_dev.addressed = 1;
-        break;
-
-        case TUSB_REQ_GET_CONFIGURATION: {
-          uint8_t cfg_num = _usbd_dev.cfg_num;
-          tud_control_xfer(rhport, p_request, &cfg_num, 1);
-        }
-        break;
-
-        case TUSB_REQ_SET_CONFIGURATION: {
-          uint8_t const cfg_num = (uint8_t) p_request->wValue;
-
-          // Only process if new configure is different
-          if (_usbd_dev.cfg_num != cfg_num) {
-            if (_usbd_dev.cfg_num != 0) {
-              // already configured: need to clear all endpoints and driver first
-              TU_LOG_USBD("  Clear current Configuration (%u) before switching\r\n", _usbd_dev.cfg_num);
-
-              dcd_sof_enable(rhport, false);
-              dcd_edpt_close_all(rhport);
-
-              // close all drivers and current configured state except bus speed
-              const uint8_t speed = _usbd_dev.speed;
-              configuration_reset(rhport);
-
-              _usbd_dev.speed = speed; // restore speed
-            }
-
-            _usbd_dev.cfg_num = cfg_num;
-
-            // Handle the new configuration
-            if (cfg_num == 0) {
-              tud_umount_cb();
-            } else {
-              if (!process_set_config(rhport, cfg_num)) {
-                _usbd_dev.cfg_num = 0;
-                TU_ASSERT(false);
-              }
-              tud_mount_cb();
-            }
-          }
-
-          tud_control_status(rhport, p_request);
-        }
-        break;
-
-        case TUSB_REQ_GET_DESCRIPTOR:
-          TU_VERIFY(process_get_descriptor(rhport, p_request));
-        break;
-
-        case TUSB_REQ_SET_FEATURE:
-          switch(p_request->wValue) { //-V2520
-            case TUSB_REQ_FEATURE_REMOTE_WAKEUP:
-              TU_LOG_USBD("    Enable Remote Wakeup\r\n");
-              // Host may enable remote wake up before suspending especially HID device
-              _usbd_dev.remote_wakeup_en = 1;
-              tud_control_status(rhport, p_request);
-              break;
-
-            #if CFG_TUD_TEST_MODE
-            case TUSB_REQ_FEATURE_TEST_MODE: {
-              // Only handle the test mode if supported and valid
-              TU_VERIFY(0 == tu_u16_low(p_request->wIndex));
-
-              uint8_t const selector = tu_u16_high(p_request->wIndex);
-              TU_VERIFY(TUSB_FEATURE_TEST_J <= selector && selector <= TUSB_FEATURE_TEST_FORCE_ENABLE);
-
-              ctrl_xfer->complete_cb = process_test_mode_cb;
-              tud_control_status(rhport, p_request);
-              break;
-            }
-            #endif
-
-            // Stall unsupported feature selector
-            default: return false;
-          }
-        break;
-
-        case TUSB_REQ_CLEAR_FEATURE:
-          // Only support remote wakeup for device feature
-          TU_VERIFY(TUSB_REQ_FEATURE_REMOTE_WAKEUP == p_request->wValue);
-          TU_LOG_USBD("    Disable Remote Wakeup\r\n");
-
-          // Host may disable remote wake up after resuming
-          _usbd_dev.remote_wakeup_en = 0;
-          tud_control_status(rhport, p_request);
-          break;
-
-        case TUSB_REQ_GET_STATUS: {
-          // Device status bit mask
-          // - Bit 0: Self Powered TODO must invoke callback to get actual status
-          // - Bit 1: Remote Wakeup enabled
-          uint16_t status = (uint16_t)_usbd_dev.dev_state_bm;
-          tud_control_xfer(rhport, p_request, &status, 2);
-          break;
-        }
-
-        // Unknown/Unsupported request
-        default: TU_BREAKPOINT(); return false;
-      }
-    break;
+      return process_std_device_request(rhport, p_request);
 
     //------------- Class/Interface Specific Request -------------//
     case TUSB_REQ_RCPT_INTERFACE: {
